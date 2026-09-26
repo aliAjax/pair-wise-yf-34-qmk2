@@ -1,3 +1,77 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>无人机空域协调台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#4338ca;color:white;border:0;border-radius:6px}</style>
-<h1>无人机空域协调台</h1><p>查看飞行计划与当前空域限制。提交、审核、变更和紧急授权通过 JSON API 完成。</p><section><input id="u" value="reviewer"><input id="r" value="airspace_reviewer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1280px;margin:32px auto;background:#f3f6fa;padding:0 20px;color:#172033}
+h1{margin-bottom:4px}.bar{background:white;padding:14px 18px;border-radius:12px;box-shadow:0 2px 12px #0001;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+input,button,select{font:inherit;padding:8px 10px;margin:2px;border-radius:6px;border:1px solid #cbd5e1}
+button{background:#4338ca;color:white;border:0;cursor:pointer}.btn-ok{background:#047857}.btn-bad{background:#b91c1c}.btn-warn{background:#b45309}.btn-plain{background:#475569}
+.cols{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:16px 0}
+.col{background:white;border-radius:12px;box-shadow:0 2px 12px #0001;padding:14px;min-height:120px}
+.col h2{font-size:16px;margin:0 0 4px}.col .hint{color:#64748b;font-size:12px;margin-bottom:10px}
+.card{border:1px solid #e2e8f0;border-radius:10px;padding:10px;margin:8px 0;background:#f8fafc}
+.card.ready{border-color:#059669;background:#ecfdf5}.tag{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;margin-right:6px}
+.t-released{background:#d1fae5;color:#065f46}.t-rejected{background:#fee2e2;color:#991b1b}.t-withdrawn{background:#fef3c7;color:#92400e}
+.t-canceled{background:#e2e8f0;color:#334155}.t-expired{background:#e2e8f0;color:#334155}.t-open{background:#dbeafe;color:#1e40af}
+.item{display:flex;justify-content:space-between;gap:8px;padding:5px 8px;margin:3px 0;border-radius:6px;background:white;border:1px solid #e2e8f0;font-size:13px}
+.s-confirmed{color:#047857}.s-pending{color:#b45309}.s-stale{color:#b91c1c;font-weight:600}.s-need_resubmit{color:#b91c1c}
+.pending{color:#b91c1c;font-size:13px}.reason{width:100%;margin:4px 0}.err{color:#b91c1c;font-size:13px;white-space:pre-wrap}
+details{margin-top:6px;font-size:12px}summary{cursor:pointer;color:#4338ca}.muted{color:#64748b;font-size:12px}pre{white-space:pre-wrap;word-break:break-all}
+</style>
+<h1>无人机空域协调台</h1><p class="muted">冲突协商单：运营方确认各家计划的避让版本，审核员在全部确认一致且重查无相邻交通冲突后放行。</p>
+<div class="bar">
+  <label>用户 <input id="u" value="reviewer" size="10"></label>
+  <label>角色 <select id="r" onchange="roleHint()">
+    <option value="airspace_reviewer">空域审核员</option><option value="operator">运营方</option>
+    <option value="commander">指挥官</option><option value="auditor">审计员</option><option value="viewer">公众</option></select></label>
+  <label>运营方 <input id="op" value="OPA" size="8"></label>
+  <button onclick="load()">刷新</button><span id="clock" class="muted"></span>
+</div>
+<div class="cols" id="cols"></div>
+<section class="col" style="max-width:none"><h2>原始状态 <span class="hint">/api/state</span></h2><pre id="raw"></pre></section>
+
+<script>
+const STATE_LABEL={pending:'待确认',stale:'计划已改动·确认失效需重做',need_resubmit:'计划被拒绝·需重新提交',confirmed:'已确认且版本一致'};
+const STATUS_LABEL={open:'协商中',released:'已放行',rejected:'已拒绝',withdrawn:'已撤回',canceled:'已取消',expired:'已过期'};
+const COLS=[['to_confirm','待确认 / 待处理','运营方：有自己的计划待确认；审核员：各方尚未确认齐'],
+            ['approvable','可批准','运营方：己方已确认、等待审核；审核员：全部确认且重查无相邻冲突'],
+            ['closed','已结束','已放行、拒绝、撤回、取消或过期']];
+function headers(){return {'X-User-Id':u.value,'X-Role':r.value,'X-Operator':op.value,'Content-Type':'application/json'};}
+function roleHint(){op.style.display=r.value==='operator'?'':'none';}
+async function api(path,method='GET',body){let x=await fetch(path,{method,headers:headers(),body:body?JSON.stringify(body):undefined});let j=await x.json();if(!x.ok)throw (j.message||x.status)+(j.details?'\n'+JSON.stringify(j.details,null,1):'');return j;}
+async function act(fn){try{await fn();await load();}catch(e){alert(e);}}
+function itemRow(it){return `<div class="item"><span>${it.is_main?'★':''}计划#${it.plan_id} ${it.callsign} <span class="muted">(${it.operator_id})</span><br>
+  <span class="muted">基准版本 ${it.base_revision} → 当前 ${it.current_revision}，确认 ${it.confirmed_revision??'—'}</span></span>
+  <span class="s-${it.state}">${STATE_LABEL[it.state]||it.state}</span></div>`;}
+function actions(n,key){const role=r.value;let h='';
+  if(role==='operator'){
+    n.items.filter(i=>i.operator_id===op.value && i.state!=='confirmed').forEach(i=>{h+=`<button class="btn-ok" onclick="act(async()=>api('/api/negotiations/${n.id}/confirm','POST',{plan_id:${i.plan_id},confirmed_revision:${i.current_revision}}))">按版本${i.current_revision}确认 #${i.plan_id}</button>`;});
+    if(n.items.some(i=>i.is_main&&i.operator_id===op.value))h+=`<button class="btn-warn" onclick="withdraw(${n.id})">撤回协商单</button>`;
+  }
+  if(key==='approvable'&&(role==='airspace_reviewer'||role==='commander')){
+    h+=`<input class="reason" id="rel-reason-${n.id}" placeholder="放行原因（必填）"><input class="reason" id="rel-off-${n.id}" placeholder="离线审核编号 offline_id（必填）">`;
+    h+=`<button class="btn-ok" onclick="release(${n.id})">放行并批准全部计划</button>`;
+  }
+  if(key!=='closed'&&(role==='airspace_reviewer'||role==='commander'))h+=`<button class="btn-bad" onclick="rejectNeg(${n.id})">拒绝协商单</button>`;
+  return h;}
+async function rejectNeg(id){let reason=prompt('拒绝原因（必填）');if(!reason)return;await act(()=>api(`/api/negotiations/${id}/reject`,'POST',{reason}));}
+async function withdraw(id){let reason=prompt('撤回原因（必填）');if(!reason)return;await act(()=>api(`/api/negotiations/${id}/withdraw`,'POST',{reason}));}
+async function release(id){let reason=document.getElementById('rel-reason-'+id).value.trim(),offline_id=document.getElementById('rel-off-'+id).value.trim();
+  if(!reason||!offline_id)return alert('放行原因和离线审核编号必填');
+  let body={reason,offline_id};if(r.value==='commander'){let ov=prompt('如需覆盖空域限制等阻断冲突，填写紧急授权原因（否则留空）');if(ov)body.override_reason=ov;}
+  await act(()=>api(`/api/negotiations/${id}/release`,'POST',body));}
+function card(n,key){return `<div class="card ${n.ready?'ready':''}">
+  <span class="tag t-${n.status}">${STATUS_LABEL[n.status]||n.status}</span><b>协商单 #${n.id}</b> <span class="muted">主计划 #${n.main_plan_id} · ${n.created_role}</span>
+  ${n.reason?`<div class="muted">起因：${n.reason}</div>`:''}
+  ${n.close_reason?`<div class="muted">结束原因：${n.close_reason}</div>`:''}
+  ${n.status==='open'&&n.pending_operators&&n.pending_operators.length?`<div class="pending">仍需重做/确认的运营方：${n.pending_operators.join('、')}</div>`:''}
+  ${(n.items||[]).map(itemRow).join('')}
+  <div>${actions(n,key)}</div>
+  <details><summary>事件记录</summary><pre>${(n.events||[]).map(e=>`${e.created_at} ${e.actor} ${e.action}${e.reason?'：'+e.reason:''}`).join('\n')}</pre></details>
+</div>`;}
+async function load(){roleHint();
+  let s=await api('/api/state');clock.textContent='服务器时间 '+s.server_time;
+  let b=s.negotiations||{to_confirm:[],approvable:[],closed:[]};
+  cols.innerHTML=COLS.map(([key,title,hint])=>`<div class="col"><h2>${title}</h2><div class="hint">${hint}</div>${(b[key]||[]).map(n=>card(n,key)).join('')||'<div class="muted">无</div>'}</div>`).join('');
+  raw.textContent=JSON.stringify(s,null,2);
+}
+load();
+</script>
