@@ -1,3 +1,94 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>无人机空域协调台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#4338ca;color:white;border:0;border-radius:6px}</style>
-<h1>无人机空域协调台</h1><p>查看飞行计划与当前空域限制。提交、审核、变更和紧急授权通过 JSON API 完成。</p><section><input id="u" value="reviewer"><input id="r" value="airspace_reviewer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}
+section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}
+pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}
+input,select,button{font:inherit;padding:8px;margin:4px}
+button{background:#4338ca;color:white;border:0;border-radius:6px;cursor:pointer}
+button:disabled{background:#c7d2fe;cursor:not-allowed}
+button.ghost{background:#e2e8f0;color:#172033}
+.card{border:1px solid #dbe3ef;border-radius:10px;padding:12px 16px;margin:10px 0}
+.card h3{margin:0 0 6px;font-size:16px}
+.tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;margin-right:6px;background:#e2e8f0}
+.tag.ok{background:#bbf7d0}.tag.wait{background:#fde68a}.tag.redo{background:#fecaca}.tag.done{background:#c7d2fe}.tag.out{background:#e5e7eb;color:#6b7280}
+.muted{color:#64748b;font-size:13px}
+.blockers{color:#b91c1c;font-size:13px;margin-top:6px}
+.mine{outline:2px solid #f59e0b}
+</style>
+<h1>无人机空域协调台</h1>
+<section>
+  用户 <input id="u" value="reviewer1">
+  角色 <select id="r">
+    <option value="airspace_reviewer">airspace_reviewer</option>
+    <option value="operator">operator</option>
+    <option value="commander">commander</option>
+    <option value="auditor">auditor</option>
+    <option value="viewer">viewer</option>
+  </select>
+  运营方 <input id="op" value="OP1">
+  <button onclick="load()">刷新</button>
+  <div class="muted">运营方角色需填写运营方编号。确认、拒绝、撤回、放行均按当前身份调用 JSON API；创建协商单用 POST /api/plans/{id}/negotiations。</div>
+</section>
+<section><h2>冲突协商单 · 待确认</h2><div id="pending">加载中…</div></section>
+<section><h2>冲突协商单 · 可批准</h2><div id="approvable"></div></section>
+<section><h2>冲突协商单 · 已结束</h2><div id="finished"></div></section>
+<section><h2>计划与空域限制（原始数据）</h2><pre id="raw"></pre></section>
+<script>
+const H=()=>({'X-User-Id':u.value,'X-Role':r.value,'X-Operator':op.value,'Content-Type':'application/json'});
+async function api(path,method,body){
+  const res=await fetch(path,{method:method||'GET',headers:H(),body:body?JSON.stringify(body):undefined});
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok){alert((data.message||res.status)+(data.details&&data.details.blockers?'\n'+data.details.blockers.join('\n'):''));throw new Error(data.message||res.status)}
+  return data;
+}
+const PARTY_LABEL={pending:'待确认',confirmed:'已确认',stale:'需重做',declined:'已拒绝',exited:'已退出'};
+const PARTY_CLASS={pending:'wait',confirmed:'ok',stale:'redo',declined:'out',exited:'out'};
+const CLOSE_LABEL={released:'已放行',declined:'协商被拒绝',withdrawn:'已撤回',canceled:'主计划已取消',expired:'已过期',rejected:'主计划被拒绝'};
+const EXIT_LABEL={rejected:'计划被拒绝',canceled:'计划已取消',expired:'计划已过期'};
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function partyHtml(p){
+  const rev=p.confirmed_revision==null?`当前 v${p.current_revision??'—'}`:`确认 v${p.confirmed_revision} / 当前 v${p.current_revision??'—'}`;
+  const exit=p.effective_status==='exited'&&p.exit_reason?`（${EXIT_LABEL[p.exit_reason]||p.exit_reason}）`:'';
+  return `<div>· ${esc(p.operator_id)} 的计划 ${esc(p.callsign||'')} (#${p.plan_id}) ${p.role_in_ticket==='primary'?'[主计划]':'[相关]'}
+    <span class="tag ${PARTY_CLASS[p.effective_status]||''}">${PARTY_LABEL[p.effective_status]||p.effective_status}</span>
+    <span class="muted">${rev}，入单时 v${p.base_revision}${exit}</span></div>`;
+}
+function card(t){
+  const me=r.value==='operator'?op.value:null;
+  const acts=[];
+  if(t.status==='open'){
+    for(const p of t.parties.filter(p=>p.operator_id===me&&['pending','stale'].includes(p.effective_status))){
+      acts.push(`<button onclick="confirmTicket(${t.id},${p.plan_id})">确认接受 ${esc(p.callsign||'#'+p.plan_id)}</button>`);
+      acts.push(`<button class="ghost" onclick="declineTicket(${t.id},${p.plan_id})">拒绝协商</button>`);
+    }
+    if(['airspace_reviewer','commander'].includes(r.value)){
+      acts.push(`<button onclick="releaseTicket(${t.id})" ${t.releasable?'':'disabled'}>放行</button>`);
+      acts.push(`<button class="ghost" onclick="withdrawTicket(${t.id})">撤回</button>`);
+    }else if(me&&t.parties.some(p=>p.role_in_ticket==='primary'&&p.operator_id===me)){
+      acts.push(`<button class="ghost" onclick="withdrawTicket(${t.id})">撤回</button>`);
+    }
+  }
+  const head=`协商单 #${t.id} · 主计划 ${esc(t.primary_callsign||'')} (#${t.primary_plan_id})`+
+    (t.status==='open'?'':` <span class="tag done">${CLOSE_LABEL[t.close_kind]||'已结束'}</span>`)+
+    (t.my_action_needed?' <span class="tag wait">需要我确认</span>':'');
+  const blockers=(t.release_blockers||[]).length?`<div class="blockers">待处理：${esc(t.release_blockers.join('；'))}</div>`:'';
+  const redo=(t.redo_operators||[]).length?`<div class="blockers">需重做确认的运营方：${esc(t.redo_operators.join('、'))}</div>`:'';
+  const close=t.status==='open'?'':`<div class="muted">结束原因：${esc(t.close_reason||'—')}（${esc(t.closed_at||'')}）</div>`;
+  return `<div class="card ${t.my_action_needed?'mine':''}"><h3>${head}</h3>${t.parties.map(partyHtml).join('')}${blockers}${redo}${close}<div>${acts.join('')}</div></div>`;
+}
+async function confirmTicket(id,planId){await api(`/api/negotiations/${id}/confirm`,'POST',{plan_id:planId});load()}
+async function declineTicket(id,planId){const reason=prompt('拒绝原因（必填）');if(reason){await api(`/api/negotiations/${id}/decline`,'POST',{plan_id:planId,reason});load()}}
+async function withdrawTicket(id){const reason=prompt('撤回原因（必填）');if(reason){await api(`/api/negotiations/${id}/withdraw`,'POST',{reason});load()}}
+async function releaseTicket(id){const reason=prompt('放行说明（必填）','协商一致，同意放行');if(reason){await api(`/api/negotiations/${id}/release`,'POST',{reason,offline_id:'web-'+Date.now()});load()}}
+async function load(){
+  try{
+    const s=await api('/api/state');
+    const n=s.negotiations||{pending_confirm:[],approvable:[],finished:[]};
+    pending.innerHTML=n.pending_confirm.map(card).join('')||'<div class="muted">暂无</div>';
+    approvable.innerHTML=n.approvable.map(card).join('')||'<div class="muted">暂无</div>';
+    finished.innerHTML=n.finished.map(card).join('')||'<div class="muted">暂无</div>';
+    raw.textContent=JSON.stringify({plans:s.plans,restrictions:s.restrictions,server_time:s.server_time},null,2);
+  }catch(e){pending.textContent='加载失败：'+e.message}
+}
+load();
+</script>

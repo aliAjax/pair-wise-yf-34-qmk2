@@ -7,52 +7,18 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from common import ApiError, boxes_overlap, iso, parse_time, route_bbox, times_overlap, utcnow, validate_route
+from negotiation_service import NegotiationService
+from negotiation_store import SCHEMA as NEGOTIATION_SCHEMA
+
 PORT = 8205
 ROLES = {"viewer", "operator", "airspace_reviewer", "commander", "auditor"}
 ACTIVE_STATUSES = {"submitted", "approved"}
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str, details: Any = None):
-        super().__init__(message); self.status, self.code, self.message, self.details = status, code, message, details
-
-
-def utcnow() -> datetime: return datetime.now(timezone.utc)
-def iso(value: datetime | None = None) -> str: return (value or utcnow()).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-def parse_time(value: str | None) -> datetime:
-    if not value: raise ApiError(400, "time_required", "必须提供 ISO 8601 时间")
-    try: parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc: raise ApiError(400, "invalid_time", f"时间格式错误: {value}") from exc
-    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
-
-
-def route_bbox(route: list[list[float]]) -> tuple[float, float, float, float]:
-    xs = [float(point[0]) for point in route]; ys = [float(point[1]) for point in route]
-    return min(xs), min(ys), max(xs), max(ys)
-
-
-def boxes_overlap(a: tuple[float, float, float, float], b: tuple[float, float, float, float], buffer: float = 0.0) -> bool:
-    return a[0] <= b[2] + buffer and a[2] + buffer >= b[0] and a[1] <= b[3] + buffer and a[3] + buffer >= b[1]
-
-
-def times_overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool: return a_start < b_end and b_start < a_end
-
-
-def validate_route(route: Any) -> list[list[float]]:
-    if not isinstance(route, list) or len(route) < 2: raise ApiError(400, "invalid_route", "航线至少需要两个经纬度点")
-    normalized: list[list[float]] = []
-    for point in route:
-        if not isinstance(point, list) or len(point) != 2 or not all(isinstance(v, (int, float)) for v in point): raise ApiError(400, "invalid_route_point", "每个航线点必须是 [经度,纬度]")
-        lon, lat = float(point[0]), float(point[1])
-        if not -180 <= lon <= 180 or not -90 <= lat <= 90: raise ApiError(400, "invalid_coordinates", "经纬度超出范围")
-        normalized.append([lon, lat])
-    return normalized
 
 
 class Repository:
@@ -104,7 +70,10 @@ class Repository:
 
 
 class DroneAirspaceService:
-    def __init__(self, path: str | Path): self.repo = Repository(path)
+    def __init__(self, path: str | Path):
+        self.repo = Repository(path)
+        self.repo.conn.executescript(NEGOTIATION_SCHEMA)
+        self.negotiations = NegotiationService(self)
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -210,6 +179,21 @@ class DroneAirspaceService:
             Repository.audit(conn, plan_id, actor, role, "plan_submitted", {"revision": plan["revision"]})
             return {"plan": self.get_plan(plan_id, role, operator), "idempotent": False}
 
+    def _apply_approval(self, conn: sqlite3.Connection, plan: sqlite3.Row, actor: str, role: str, reason: str, offline_id: str, override: str) -> tuple[int, str | None]:
+        """批准落库：硬约束与空域冲突校验、批准记录、状态更新、审计与通知。approve 与协商放行共用。"""
+        report = self._conflict_report(conn, plan)
+        if report["hard_violations"]: raise ApiError(409, "hard_constraint_violation", "计划违反不可覆盖的安全约束", report)
+        if report["blocking_conflicts"] and not (role == "commander" and override):
+            raise ApiError(409, "airspace_conflict", "计划存在空域或相邻交通冲突", report)
+        override_kind = "emergency_authority" if report["blocking_conflicts"] else None
+        cur = conn.execute("""INSERT INTO approvals(plan_id,plan_revision,reviewer,decision,reason,offline_id,override_kind,created_at)
+                              VALUES(?,?,?,?,?,?,?,?)""", (plan["id"], plan["revision"], actor, "approved", reason, offline_id, override_kind, iso()))
+        conn.execute("UPDATE flight_plans SET status='approved',updated_at=? WHERE id=?", (iso(), plan["id"]))
+        if override_kind: Repository.audit(conn, plan["id"], actor, role, "emergency_override_used", {"override_reason": override, "conflicts": report["blocking_conflicts"]})
+        Repository.audit(conn, plan["id"], actor, role, "plan_approved", {"revision": plan["revision"], "offline_id": offline_id})
+        Repository.notify(conn, plan["id"], "approved", f"飞行计划 {plan['callsign']} 已批准")
+        return cur.lastrowid, override_kind
+
     def approve(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "review_forbidden", "只有空域审核员或指挥官可以批准")
         expected, offline_id = body.get("expected_revision"), str(body.get("offline_id", "")).strip()
@@ -225,18 +209,9 @@ class DroneAirspaceService:
             if plan["status"] == "approved": return {"plan": self.get_plan(plan_id, role, ""), "idempotent": True}
             if plan["status"] != "submitted": raise ApiError(409, "invalid_transition", "只有已提交计划可以批准")
             if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "计划版本已变化，审核决定不能套用")
-            report = self._conflict_report(conn, plan)
-            if report["hard_violations"]: raise ApiError(409, "hard_constraint_violation", "计划违反不可覆盖的安全约束", report)
-            if report["blocking_conflicts"] and not (role == "commander" and override):
-                raise ApiError(409, "airspace_conflict", "计划存在空域或相邻交通冲突", report)
-            override_kind = "emergency_authority" if report["blocking_conflicts"] else None
-            cur = conn.execute("""INSERT INTO approvals(plan_id,plan_revision,reviewer,decision,reason,offline_id,override_kind,created_at)
-                                  VALUES(?,?,?,?,?,?,?,?)""", (plan_id, expected, actor, "approved", reason, offline_id, override_kind, iso()))
-            conn.execute("UPDATE flight_plans SET status='approved',updated_at=? WHERE id=?", (iso(), plan_id))
-            if override_kind: Repository.audit(conn, plan_id, actor, role, "emergency_override_used", {"override_reason": override, "conflicts": report["blocking_conflicts"]})
-            Repository.audit(conn, plan_id, actor, role, "plan_approved", {"revision": expected, "offline_id": offline_id})
-            Repository.notify(conn, plan_id, "approved", f"飞行计划 {plan['callsign']} 已批准")
-            return {"plan": self.get_plan(plan_id, role, ""), "idempotent": False, "approval_id": cur.lastrowid, "override_kind": override_kind}
+            approval_id, override_kind = self._apply_approval(conn, plan, actor, role, reason, offline_id, override)
+            self.negotiations.sync_plan_event(conn, plan, "approved")
+            return {"plan": self.get_plan(plan_id, role, ""), "idempotent": False, "approval_id": approval_id, "override_kind": override_kind}
 
     def reject(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "review_forbidden", "当前角色不能拒绝计划")
@@ -253,6 +228,7 @@ class DroneAirspaceService:
             conn.execute("UPDATE flight_plans SET status='rejected',updated_at=? WHERE id=?", (iso(), plan_id))
             Repository.audit(conn, plan_id, actor, role, "plan_rejected", {"reason": reason, "offline_id": offline_id})
             Repository.notify(conn, plan_id, "rejected", f"飞行计划 {plan['callsign']} 被拒绝：{reason}")
+            self.negotiations.sync_plan_event(conn, plan, "rejected")
             return {"plan": self.get_plan(plan_id, role, ""), "idempotent": False}
 
     def change(self, plan_id: int, actor: str, role: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -290,6 +266,7 @@ class DroneAirspaceService:
             conn.execute("UPDATE flight_plans SET status='canceled',updated_at=? WHERE id=?", (iso(), plan_id))
             Repository.audit(conn, plan_id, actor, role, "plan_canceled", {"reason": reason})
             Repository.notify(conn, plan_id, "canceled", f"飞行计划 {plan['callsign']} 已取消：{reason}")
+            self.negotiations.sync_plan_event(conn, plan, "canceled")
             return {"plan": self.get_plan(plan_id, role, operator), "idempotent": False}
 
     def notifications(self, actor: str, role: str, operator: str) -> dict[str, Any]:
@@ -308,6 +285,8 @@ class DroneAirspaceService:
                 conn.execute("UPDATE flight_plans SET status='expired',updated_at=? WHERE id=?", (now, row["id"]))
                 Repository.audit(conn, row["id"], actor, role, "plan_expired", {})
                 Repository.notify(conn, row["id"], "expired", f"飞行计划 {row['callsign']} 已过期")
+                self.negotiations.sync_plan_event(conn, row, "expired")
+            self.negotiations.sweep_expired(conn, now)
         return {"expired": len(rows)}
 
     def state(self, role: str, operator: str) -> dict[str, Any]:
@@ -319,7 +298,7 @@ class DroneAirspaceService:
         for row in rows:
             item = self.get_plan(row["id"], role, operator); plans.append(item)
         restrictions = [dict(r) for r in conn.execute("SELECT * FROM restrictions WHERE status='active' ORDER BY id DESC")] if role in {"airspace_reviewer", "commander", "auditor"} else []
-        return {"plans": plans, "restrictions": restrictions, "server_time": iso()}
+        return {"plans": plans, "restrictions": restrictions, "negotiations": self.negotiations.state_for(role, operator), "server_time": iso()}
 
 
 def send_json(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -341,15 +320,28 @@ class Handler(BaseHTTPRequestHandler):
         actor, role, operator = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state(role, operator)
         if path == "/api/notifications": return 200, self.service.notifications(actor, role, operator)
+        if path == "/api/negotiations": return 200, self.service.negotiations.state_for(role, operator)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]), role, operator)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "check": return 200, self.service.check_conflicts(int(parts[2]), role, operator)
+        if len(parts) == 3 and parts[:2] == ["api", "negotiations"] and parts[2].isdigit(): return 200, self.service.negotiations.get_view(int(parts[2]), role, operator)
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
         actor, role, operator = self.service.identity(self.headers); body = self.body(); parts = [p for p in path.split("/") if p]
         if path == "/api/restrictions": return 201, self.service.create_restriction(actor, role, body)
         if path == "/api/plans": return 201, self.service.create_plan(actor, role, operator, body)
         if path == "/api/expire": return 200, self.service.expire_plans(actor, role)
+        if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "negotiations":
+            return 201, self.service.negotiations.create_for_plan(int(parts[2]), actor, role, operator)
+        if len(parts) == 4 and parts[:2] == ["api", "negotiations"] and parts[2].isdigit():
+            tid, action = int(parts[2]), parts[3]
+            routes = {
+                "confirm": lambda: self.service.negotiations.confirm(tid, actor, role, operator, body),
+                "decline": lambda: self.service.negotiations.decline(tid, actor, role, operator, body),
+                "withdraw": lambda: self.service.negotiations.withdraw(tid, actor, role, operator, body),
+                "release": lambda: self.service.negotiations.release(tid, actor, role, body),
+            }
+            if action in routes: return 200, routes[action]()
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
             pid, action = int(parts[2]), parts[3]
             routes = {
